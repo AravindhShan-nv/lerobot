@@ -304,345 +304,71 @@ class Gr00tN1d6Policy(PreTrainedPolicy):
             and not (k.startswith("next.") or k == "info")
         }
 
-        # Debug: Check what state keys are in the batch
-        state_keys_in_batch = [k for k in batch if "state" in k.lower()]
-        if state_keys_in_batch:
-            import logging
-
-            logging.debug(f"State keys found in batch: {state_keys_in_batch}")
-
-        # Validate and fix state dimensions if needed
-        # The state encoder expects [B, T, max_state_dim] where max_state_dim=29
-        # Check multiple possible state keys
-        state_tensor = None
-        if "state" in groot_inputs:
-            state_tensor = groot_inputs["state"]
-        elif "state" in batch:
-            state_tensor = batch["state"]
-        elif "observation.state" in batch:
-            state_tensor = batch["observation.state"]
-
-        if state_tensor is not None:
-            state = state_tensor
-            device = state.device
-            # Use checkpoint's expected state dimension instead of config
-            # The checkpoint may have been trained with a different max_state_dim
-            max_state_dim = self._checkpoint_max_state_dim
-
-            # Handle different state formats
-            if state.ndim == 2:
-                # [B, state_dim] -> need to check if it's padded correctly
-                batch_size, state_dim = state.shape
-
-                if state_dim != max_state_dim:
-                    # State is not padded correctly - pad or truncate
-                    if state_dim < max_state_dim:
-                        # Pad with zeros
-                        padding = torch.zeros(
-                            batch_size,
-                            max_state_dim - state_dim,
-                            device=device,
-                            dtype=state.dtype,
-                        )
-                        state = torch.cat([state, padding], dim=1)
-                    else:
-                        # Truncate if somehow larger (shouldn't happen, but be defensive)
-                        # This suggests a preprocessing issue - log a warning
-                        warnings.warn(
-                            f"State dimension mismatch: expected {max_state_dim}, "
-                            f"got {state_dim}. Truncating state tensor. "
-                            "This may indicate a preprocessing issue.",
-                            stacklevel=2,
-                        )
-                        state = state[:, :max_state_dim]
-
-                # Always update groot_inputs with processed state
-                groot_inputs["state"] = state
-            elif state.ndim == 3:
-                # [B, T, state_dim] - check last dimension
-                batch_size, seq_len, state_dim = state.shape
-
-                if state_dim != max_state_dim:
-                    if state_dim < max_state_dim:
-                        # Pad with zeros
-                        padding = torch.zeros(
-                            batch_size,
-                            seq_len,
-                            max_state_dim - state_dim,
-                            device=device,
-                            dtype=state.dtype,
-                        )
-                        state = torch.cat([state, padding], dim=2)
-                    else:
-                        # Truncate if somehow larger
-                        warnings.warn(
-                            f"State dimension mismatch: expected {max_state_dim}, "
-                            f"got {state_dim}. Truncating state tensor. "
-                            "This may indicate a preprocessing issue.",
-                            stacklevel=2,
-                        )
-                        state = state[:, :, :max_state_dim]
-
-                # Always update groot_inputs with processed state
-                groot_inputs["state"] = state
-            else:
-                # Unexpected state format - try to handle gracefully
-                warnings.warn(
-                    f"Unexpected state tensor shape: {state.shape}. Expected 2D [B, D] or 3D [B, T, D].",
-                    stacklevel=2,
-                )
-                groot_inputs["state"] = state
-        else:
-            # No state found - this is an error
-            raise ValueError(
-                "State tensor not found in batch. Expected keys: 'state' or "
-                "'observation.state'. Found keys: " + str(list(batch.keys()))
-            )
-
-        # Get device from model parameters if state wasn't found
+        # Validate inputs are already properly preprocessed by the processor
+        # The processor (Gr00tN1d6Processor.__call__) handles:
+        # - State padding to max_state_dim (lines 871-877)
+        # - Action padding to max_action_dim and max_action_horizon (lines 834-856)
+        # - Action mask creation (lines 858-860)
+        
+        # Validate state exists and has correct shape
         if "state" not in groot_inputs:
-            device = next(self.parameters()).device
-        else:
-            device = groot_inputs["state"].device
-
-        # Process actions: reshape and pad/truncate to match checkpoint
-        # The checkpoint may expect a different action dimension than our config
-        action_tensor = None
+            raise ValueError(
+                "State tensor not found in batch. Expected key: 'state'. "
+                f"Found keys: {list(groot_inputs.keys())}"
+            )
+        
+        state = groot_inputs["state"]
+        device = state.device
+        
+        # Validate state dimensions (2D [B, D] or 3D [B, T, D])
+        if state.ndim not in (2, 3):
+            raise ValueError(
+                f"State tensor has unexpected shape: {state.shape}. "
+                "Expected 2D [B, D] or 3D [B, T, D]."
+            )
+        
+        # Validate state is padded to checkpoint's expected dimension
+        expected_state_dim = self._checkpoint_max_state_dim
+        actual_state_dim = state.shape[-1]
+        if actual_state_dim != expected_state_dim:
+            raise ValueError(
+                f"State dimension mismatch: expected {expected_state_dim}, got {actual_state_dim}. "
+                "The processor should have padded the state to the correct dimension."
+            )
+        
+        # Validate action dimensions if present (training mode)
         if "action" in groot_inputs:
-            action_tensor = groot_inputs["action"]
-        elif "action" in batch:
-            action_tensor = batch["action"]
-
-        if action_tensor is not None:
-            actions = action_tensor
-            max_action_dim = self._checkpoint_max_action_dim
-
-            # Handle different action formats
-            if actions.ndim == 2:
-                # [B*T, action_dim] or [B, action_dim] - need to reshape
-                batch_size_total, action_dim = actions.shape
-
-                # Use chunk_size (max_action_horizon) as the expected sequence length
-                # This matches what the processor outputs and what the model expects
-                expected_T = self.config.chunk_size
-
-                # Try to infer batch size from state if available
-                if "state" in groot_inputs:
-                    state_shape = groot_inputs["state"].shape
-                    B = state_shape[0]  # noqa: N806 Batch size from state
-
-                    if batch_size_total == B:
-                        # Actions are [B, action_dim], need to add T dimension
-                        # Pad to expected_T
-                        actions = actions.unsqueeze(1)  # [B, action_dim] -> [B, 1, action_dim]
-                        if actions.shape[1] < expected_T:
-                            # Pad sequence dimension to expected_T
-                            padding = torch.zeros(
-                                B,
-                                expected_T - actions.shape[1],
-                                action_dim,
-                                device=device,
-                                dtype=actions.dtype,
-                            )
-                            actions = torch.cat([actions, padding], dim=1)
-                    elif batch_size_total == B * expected_T:
-                        # Actions are [B*T, action_dim], reshape to [B, T, action_dim]
-                        actions = actions.view(B, expected_T, action_dim)
-                    elif batch_size_total % B == 0:
-                        # Actions are [B*T, action_dim] where T != expected_T
-                        T = batch_size_total // B
-                        actions = actions.view(B, T, action_dim)
-                        # Pad or truncate to expected_T
-                        if expected_T > T:
-                            padding = torch.zeros(
-                                B,
-                                expected_T - T,
-                                action_dim,
-                                device=device,
-                                dtype=actions.dtype,
-                            )
-                            actions = torch.cat([actions, padding], dim=1)
-                        elif expected_T < T:
-                            warnings.warn(
-                                f"Action sequence length {T} exceeds expected {expected_T}. "
-                                "Truncating to expected length.",
-                                stacklevel=2,
-                            )
-                            actions = actions[:, :expected_T, :]
-                    else:
-                        # Fallback: assume single batch
-                        B = 1
-                        T = batch_size_total
-                        actions = actions.unsqueeze(0)  # [T, action_dim] -> [1, T, action_dim]
-                        if expected_T > T:
-                            padding = torch.zeros(
-                                1,
-                                expected_T - T,
-                                action_dim,
-                                device=device,
-                                dtype=actions.dtype,
-                            )
-                            actions = torch.cat([actions, padding], dim=1)
-                        elif expected_T < T:
-                            actions = actions[:, :expected_T, :]
-                else:
-                    # No state to infer from, use expected_T
-                    B = batch_size_total // expected_T if batch_size_total >= expected_T else 1
-                    T = expected_T if B > 0 else batch_size_total
-                    if batch_size_total == B * T:
-                        actions = actions.view(B, T, action_dim)
-                    else:
-                        # Can't reshape cleanly, pad or truncate
-                        if batch_size_total < expected_T:
-                            # Pad to [1, expected_T, action_dim]
-                            padding = torch.zeros(
-                                expected_T - batch_size_total,
-                                action_dim,
-                                device=device,
-                                dtype=actions.dtype,
-                            )
-                            actions = torch.cat([actions, padding], dim=0)
-                            actions = actions.unsqueeze(
-                                0
-                            )  # [expected_T, action_dim] -> [1, expected_T, action_dim]
-                        else:
-                            # Truncate and reshape
-                            actions = actions[:expected_T, :]
-                            actions = actions.unsqueeze(
-                                0
-                            )  # [expected_T, action_dim] -> [1, expected_T, action_dim]
-
-                # Now pad/truncate action dimension
-                B, T, action_dim = actions.shape
-                if action_dim != max_action_dim:
-                    if action_dim < max_action_dim:
-                        # Pad with zeros
-                        padding = torch.zeros(
-                            B,
-                            T,
-                            max_action_dim - action_dim,
-                            device=device,
-                            dtype=actions.dtype,
-                        )
-                        actions = torch.cat([actions, padding], dim=2)
-                    else:
-                        # Truncate if larger
-                        warnings.warn(
-                            f"Action dimension mismatch: expected {max_action_dim}, "
-                            f"got {action_dim}. Truncating action tensor.",
-                            stacklevel=2,
-                        )
-                        actions = actions[:, :, :max_action_dim]
-
-                groot_inputs["action"] = actions
-
-            elif actions.ndim == 3:
-                # [B, T, action_dim] - pad/truncate sequence length and action dimension
-                B, T, action_dim = actions.shape
-                expected_T = self.config.chunk_size
-
-                # Pad or truncate sequence length to expected_T
-                if expected_T > T:
-                    padding = torch.zeros(
-                        B,
-                        expected_T - T,
-                        action_dim,
-                        device=device,
-                        dtype=actions.dtype,
-                    )
-                    actions = torch.cat([actions, padding], dim=1)
-                elif expected_T < T:
-                    warnings.warn(
-                        f"Action sequence length {T} exceeds expected {expected_T}. "
-                        "Truncating to expected length.",
-                        stacklevel=2,
-                    )
-                    actions = actions[:, :expected_T, :]
-
-                # Pad or truncate action dimension
-                if action_dim != max_action_dim:
-                    if action_dim < max_action_dim:
-                        # Pad with zeros
-                        padding = torch.zeros(
-                            B,
-                            expected_T,
-                            max_action_dim - action_dim,
-                            device=device,
-                            dtype=actions.dtype,
-                        )
-                        actions = torch.cat([actions, padding], dim=2)
-                    else:
-                        # Truncate if larger
-                        warnings.warn(
-                            f"Action dimension mismatch: expected {max_action_dim}, "
-                            f"got {action_dim}. Truncating action tensor.",
-                            stacklevel=2,
-                        )
-                        actions = actions[:, :, :max_action_dim]
-
-                groot_inputs["action"] = actions
-            else:
-                warnings.warn(
-                    f"Unexpected action tensor shape: {actions.shape}. "
-                    "Expected 2D [B*T, D] or [B, D] or 3D [B, T, D].",
-                    stacklevel=2,
+            actions = groot_inputs["action"]
+            
+            # Validate action shape is 3D [B, T, D]
+            if actions.ndim != 3:
+                raise ValueError(
+                    f"Action tensor has unexpected shape: {actions.shape}. "
+                    "Expected 3D [B, T, D]. The processor should have reshaped actions."
                 )
-                groot_inputs["action"] = actions
-
-        # Create action_mask if missing (should have shape [B, T, D] matching action)
-        if "action" in groot_inputs and "action_mask" not in groot_inputs:
-            action = groot_inputs["action"]
-            if isinstance(action, torch.Tensor):
-                # Create default action_mask (all valid) with proper batch shape
-                groot_inputs["action_mask"] = torch.ones_like(action)
-                logging.debug(
-                    f"Created missing action_mask with shape {groot_inputs['action_mask'].shape} "
-                    f"to match action shape {action.shape}"
+            
+            # Validate action is padded to checkpoint's expected dimension
+            expected_action_dim = self._checkpoint_max_action_dim
+            actual_action_dim = actions.shape[-1]
+            if actual_action_dim != expected_action_dim:
+                raise ValueError(
+                    f"Action dimension mismatch: expected {expected_action_dim}, got {actual_action_dim}. "
+                    "The processor should have padded actions to the correct dimension."
                 )
-
-        # Pad action_mask to match padded actions [B, T, max_action_dim]
-        # The mask must have 0s for padded dimensions so they don't contribute to loss
-        if "action_mask" in groot_inputs and "action" in groot_inputs:
+            
+            # Validate action_mask exists and matches action shape
+            if "action_mask" not in groot_inputs:
+                raise ValueError(
+                    "action_mask not found in batch but action is present. "
+                    "The processor should have created action_mask."
+                )
+            
             action_mask = groot_inputs["action_mask"]
-            padded_actions = groot_inputs["action"]
-            B, T, max_action_dim = padded_actions.shape
-
-            # Handle missing batch dimension
-            if action_mask.ndim == 2:
-                # Shape [T, action_dim] -> expand to [B, T, action_dim]
-                action_mask = action_mask.unsqueeze(0).expand(B, -1, -1)
-
-            # Pad action dimension if needed
-            if action_mask.shape[-1] < max_action_dim:
-                padding = torch.zeros(
-                    B,
-                    T,
-                    max_action_dim - action_mask.shape[-1],
-                    device=action_mask.device,
-                    dtype=action_mask.dtype,
+            if action_mask.shape != actions.shape:
+                raise ValueError(
+                    f"action_mask shape {action_mask.shape} doesn't match action shape {actions.shape}. "
+                    "The processor should have created matching mask."
                 )
-                action_mask = torch.cat([action_mask, padding], dim=-1)
-            elif action_mask.shape[-1] > max_action_dim:
-                action_mask = action_mask[:, :, :max_action_dim]
-
-            # Truncate action_mask TIME dimension to match truncated actions
-            # This handles cases where processor creates mask with max_action_horizon > chunk_size
-            if action_mask.shape[1] != T:
-                action_mask = action_mask[:, :T, :]
-
-            groot_inputs["action_mask"] = action_mask
-
-        # DEBUG: Verify action_mask shape during training
-        if "action" in groot_inputs:
-            action_shape = (
-                groot_inputs["action"].shape if isinstance(groot_inputs["action"], torch.Tensor) else "N/A"
-            )
-            action_mask_shape = (
-                groot_inputs["action_mask"].shape
-                if "action_mask" in groot_inputs and isinstance(groot_inputs["action_mask"], torch.Tensor)
-                else "MISSING"
-            )
-            logging.debug(f"DEBUG: action shape: {action_shape}, action_mask shape: {action_mask_shape}")
 
         # Run GR00T forward under bf16 autocast when enabled to reduce activation memory
         # Rationale: Matches original GR00T finetuning (bf16 compute, fp32 params) and avoids fp32 upcasts.
@@ -681,26 +407,18 @@ class Gr00tN1d6Policy(PreTrainedPolicy):
             and not (k.startswith("next.") or k == "info")
         }
 
-        # Pad state to checkpoint's expected dimension (same logic as forward)
+        # Validate state is already padded by processor
+        # The processor should have already padded state to max_state_dim
         if "state" in groot_inputs:
             state = groot_inputs["state"]
-            max_state_dim = self._checkpoint_max_state_dim
-            device = state.device
-
-            if state.ndim == 2:
-                batch_size, state_dim = state.shape
-                if state_dim < max_state_dim:
-                    padding = torch.zeros(
-                        batch_size, max_state_dim - state_dim, device=device, dtype=state.dtype
-                    )
-                    groot_inputs["state"] = torch.cat([state, padding], dim=1)
-            elif state.ndim == 3:
-                batch_size, seq_len, state_dim = state.shape
-                if state_dim < max_state_dim:
-                    padding = torch.zeros(
-                        batch_size, seq_len, max_state_dim - state_dim, device=device, dtype=state.dtype
-                    )
-                    groot_inputs["state"] = torch.cat([state, padding], dim=2)
+            expected_state_dim = self._checkpoint_max_state_dim
+            actual_state_dim = state.shape[-1]
+            
+            if actual_state_dim != expected_state_dim:
+                raise ValueError(
+                    f"State dimension mismatch in inference: expected {expected_state_dim}, "
+                    f"got {actual_state_dim}. State should be preprocessed before calling predict_action_chunk."
+                )
 
         # Get device from model parameters
         device = next(self.parameters()).device

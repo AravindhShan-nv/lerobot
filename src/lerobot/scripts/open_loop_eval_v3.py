@@ -77,8 +77,6 @@ import numpy as np
 import torch
 import tyro
 from matplotlib import pyplot as plt
-from PIL import Image
-
 # LeRobot imports
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.policies.factory import get_policy_class
@@ -166,98 +164,6 @@ def plot_trajectory_results(
     plt.savefig(save_plot_path)
 
     plt.close()  # Close the figure to free memory
-
-
-def convert_lerobot_to_groot_batch(
-    lerobot_batch: dict[str, Any],
-    camera_keys: list[str],
-    state_key: str = "observation.state",
-    language_key: str = "task",
-) -> dict[str, Any]:
-    """
-    Convert LeRobot batch format to GR00T input format.
-
-    Args:
-        lerobot_batch: Batch from LeRobotDataset
-        camera_keys: List of camera keys
-        state_key: Key for state data
-        language_key: Key for language/task data
-
-    Returns:
-        Dictionary in GR00T format with video, state, and language keys
-    """
-    groot_batch = {}
-
-    # Convert video/images
-    groot_batch["video"] = {}
-    for cam_key in camera_keys:
-        if cam_key in lerobot_batch:
-            img = lerobot_batch[cam_key]
-            # Convert to numpy array if needed
-            if isinstance(img, torch.Tensor):
-                img = img.cpu().numpy()
-            elif not isinstance(img, np.ndarray):
-                # If it's not a tensor or numpy array, try to convert it
-                img = np.array(img)
-
-            # Handle different image formats
-            # LeRobot stores images as (C, H, W) - need to convert to (H, W, C) for PIL
-            if img.ndim == 3:
-                # Single image: could be (C, H, W) or (H, W, C)
-                if img.shape[0] in [1, 3, 4]:  # Likely (C, H, W) format
-                    img = np.transpose(img, (1, 2, 0))  # (C, H, W) -> (H, W, C)
-                # Now img is (H, W, C) -> (1, H, W, C)
-                img = img[None, :]
-            elif img.ndim == 4:
-                # Already batched: could be (B, C, H, W) or (B, H, W, C)
-                if img.shape[1] in [1, 3, 4] and img.shape[1] < img.shape[2]:  # Likely (B, C, H, W)
-                    img = np.transpose(img, (0, 2, 3, 1))  # (B, C, H, W) -> (B, H, W, C)
-            else:
-                raise ValueError(f"Unexpected image shape: {img.shape}")
-
-            # Ensure uint8 format
-            if img.dtype != np.uint8:
-                img = (img * 255).astype(np.uint8) if img.max() <= 1.0 else img.astype(np.uint8)
-
-            groot_batch["video"][cam_key] = img
-
-    # Convert state
-    groot_batch["state"] = {}
-    if state_key in lerobot_batch:
-        state = lerobot_batch[state_key]
-        if isinstance(state, torch.Tensor):
-            state = state.cpu().numpy()
-
-        # Handle different state formats
-        if state.ndim == 1:
-            # Single state: (D,) -> (1, D)
-            state = state[None, :]
-        elif state.ndim == 2:
-            # Already batched: (B, D) or (T, D)
-            pass
-        else:
-            raise ValueError(f"Unexpected state shape: {state.shape}")
-
-        # Use a generic key for state
-        groot_batch["state"]["state"] = state.astype(np.float32)
-
-    # Convert language/task
-    groot_batch["language"] = {}
-    if language_key in lerobot_batch:
-        task = lerobot_batch[language_key]
-        if isinstance(task, str):
-            # Single task string -> list of lists format
-            groot_batch["language"][language_key] = [[task]]
-        elif isinstance(task, (list, tuple)):
-            # Already in list format
-            if len(task) > 0 and isinstance(task[0], str):
-                groot_batch["language"][language_key] = [[t] for t in task]
-            else:
-                groot_batch["language"][language_key] = task
-        else:
-            logger.warning(f"Unexpected language format: {type(task)}, skipping")
-
-    return groot_batch
 
 
 def get_episode_frames(dataset: LeRobotDataset, episode_id: int) -> list[dict[str, Any]]:
@@ -437,6 +343,155 @@ def parse_action_gr00t(action: dict[str, Any]) -> dict[str, Any]:
     return {f"action.{key}": action[key][0] for key in action}
 
 
+def pad_state_to_checkpoint_dim(state: np.ndarray, checkpoint_max_state_dim: int) -> np.ndarray:
+    """Pad state array to match checkpoint's expected dimension.
+    
+    This ensures state has the correct dimension expected by the model checkpoint.
+    The processor (Gr00tN1d6Processor.__call__) does this padding at lines 871-877.
+    
+    Args:
+        state: State array of shape (D,) or (T, D)
+        checkpoint_max_state_dim: Expected state dimension from checkpoint
+        
+    Returns:
+        Padded state array with last dimension = checkpoint_max_state_dim
+    """
+    if state.ndim == 1:
+        # (D,) -> pad to (checkpoint_max_state_dim,)
+        if state.shape[0] < checkpoint_max_state_dim:
+            padding = np.zeros(checkpoint_max_state_dim - state.shape[0], dtype=state.dtype)
+            return np.concatenate([state, padding])
+        return state[:checkpoint_max_state_dim]
+    elif state.ndim == 2:
+        # (T, D) -> pad to (T, checkpoint_max_state_dim)
+        if state.shape[1] < checkpoint_max_state_dim:
+            padding = np.zeros((state.shape[0], checkpoint_max_state_dim - state.shape[1]), dtype=state.dtype)
+            return np.concatenate([state, padding], axis=1)
+        return state[:, :checkpoint_max_state_dim]
+    else:
+        raise ValueError(f"Unexpected state shape: {state.shape}")
+
+
+def prepare_inference_batch(
+    frame: dict[str, Any],
+    camera_keys: list[str],
+    state_key: str,
+    language_key: str,
+    processor: Any,
+    embodiment_tag: Any,
+    checkpoint_max_state_dim: int,
+    device: torch.device,
+) -> dict[str, Any]:
+    """Prepare batch for inference using processor methods.
+    
+    This function uses the processor's _apply_vlm_processing() method for VLM content
+    creation, ensuring consistency between training and inference preprocessing.
+    
+    Args:
+        frame: Single frame dict from LeRobotDataset
+        camera_keys: List of camera keys (e.g., ['observation.images.top'])
+        state_key: Key for state data (e.g., 'observation.state')
+        language_key: Key for language/task data (e.g., 'task')
+        processor: Gr00tN1d6Processor instance from the policy
+        embodiment_tag: EmbodimentTag for the policy
+        checkpoint_max_state_dim: Expected state dimension from checkpoint
+        device: Device to place tensors on
+        
+    Returns:
+        Dictionary with keys: vlm_content, state, raw_state, embodiment_id
+    """
+    from lerobot.policies.gr00t_n1d6.utils import EMBODIMENT_TAG_TO_PROJECTOR_INDEX
+    
+    policy_batch = {}
+    
+    # =========================================================================
+    # 1. Extract and format images for processor's _apply_vlm_processing
+    #    Expected format: [T, C, H, W] numpy array (uint8)
+    # =========================================================================
+    images_list = []
+    for cam_key in camera_keys:
+        if cam_key in frame:
+            img = frame[cam_key]
+            # Convert to numpy if tensor
+            if isinstance(img, torch.Tensor):
+                img = img.cpu().numpy()
+            
+            # Handle different image formats
+            # LeRobot stores images as (C, H, W) - need to ensure this format
+            if img.ndim == 3:
+                # Could be (C, H, W) or (H, W, C)
+                if img.shape[0] in [1, 3, 4]:  # Likely (C, H, W) format
+                    pass  # Already in correct format
+                else:
+                    # Assume (H, W, C), convert to (C, H, W)
+                    img = np.transpose(img, (2, 0, 1))
+            
+            # Ensure uint8 format
+            if img.dtype != np.uint8:
+                img = (img * 255).astype(np.uint8) if img.max() <= 1.0 else img.astype(np.uint8)
+            
+            images_list.append(img)
+    
+    # Stack images to [T, C, H, W] format (T=number of camera views for single timestep)
+    if images_list:
+        stacked_images = np.stack(images_list, axis=0)  # [T, C, H, W]
+    else:
+        raise ValueError(f"No images found in frame. Camera keys: {camera_keys}")
+    
+    # =========================================================================
+    # 2. Extract language/task text
+    # =========================================================================
+    task_text = "complete the task"  # Default
+    if language_key in frame:
+        task_data = frame[language_key]
+        if isinstance(task_data, str):
+            task_text = task_data
+        elif isinstance(task_data, (list, tuple)) and len(task_data) > 0:
+            task_text = task_data[0] if isinstance(task_data[0], str) else str(task_data[0])
+    
+    # =========================================================================
+    # 3. Use processor's _apply_vlm_processing for VLM content
+    #    This matches processor_gr00t_n1d6.py lines 747-782
+    # =========================================================================
+    vlm_result = processor._apply_vlm_processing(stacked_images, task_text)
+    policy_batch["vlm_content"] = vlm_result["vlm_content"]
+    
+    # =========================================================================
+    # 4. Extract and prepare state with padding
+    #    This matches processor_gr00t_n1d6.py lines 871-877
+    # =========================================================================
+    if state_key in frame:
+        state = frame[state_key]
+        if isinstance(state, torch.Tensor):
+            state = state.cpu().numpy()
+        
+        # Flatten to 1D if needed
+        if state.ndim > 1:
+            state = state.flatten()
+        
+        # Store raw state for relative->absolute action conversion
+        policy_batch["raw_state"] = {"state": state}
+        
+        # Pad state to checkpoint's expected dimension
+        padded_state = pad_state_to_checkpoint_dim(state, checkpoint_max_state_dim)
+        
+        # Convert to tensor with batch dimension: (D,) -> (1, D)
+        state_tensor = torch.from_numpy(padded_state).unsqueeze(0).to(device).float()
+        policy_batch["state"] = state_tensor
+    else:
+        raise ValueError(f"State key '{state_key}' not found in frame")
+    
+    # =========================================================================
+    # 5. Set embodiment_id
+    # =========================================================================
+    embodiment_id = EMBODIMENT_TAG_TO_PROJECTOR_INDEX.get(
+        embodiment_tag.value, 10  # Default to new_embodiment=10
+    )
+    policy_batch["embodiment_id"] = torch.tensor([embodiment_id], device=device, dtype=torch.long)
+    
+    return policy_batch
+
+
 def evaluate_single_trajectory(
     policy: Any,
     dataset: LeRobotDataset,
@@ -524,107 +579,32 @@ def evaluate_single_trajectory(
         # Get current frame
         frame = episode_frames[step_count]
 
-        # Convert to GR00T format using convert_lerobot_to_groot_batch
-        groot_batch = convert_lerobot_to_groot_batch(frame, camera_keys, state_key, language_key)
-
-        # Prepare batch for policy in vlm_content format
-        policy_batch = {}
-
-        # Extract and convert images to PIL format for vlm_content
-        pil_images = []
-        for _cam_key, img_array in groot_batch.get("video", {}).items():
-            # img_array shape: (T, H, W, C) - take first frame for inference
-            img = img_array[0] if img_array.ndim == 4 else img_array
-            # Convert to PIL Image
-            if img.dtype != np.uint8:
-                img = (img * 255).astype(np.uint8) if img.max() <= 1.0 else img.astype(np.uint8)
-            pil_images.append(Image.fromarray(img))
-
-        # Extract language/task
-        task_text = "complete the task"  # Default task
-        for _lang_key, lang_data in groot_batch.get("language", {}).items():
-            if isinstance(lang_data, list) and len(lang_data) > 0:
-                if isinstance(lang_data[0], list) and len(lang_data[0]) > 0:
-                    task_text = lang_data[0][0]
-                elif isinstance(lang_data[0], str):
-                    task_text = lang_data[0]
-            elif isinstance(lang_data, str):
-                task_text = lang_data
-            break
-
-        # Create conversation format for the VLM
-        conversation = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": task_text},
-                    *[{"type": "image", "image": img} for img in pil_images],
-                ],
-            }
-        ]
-
-        # Apply chat template to get properly formatted text
-        from lerobot.policies.gr00t_n1d6.processor_gr00t_n1d6 import build_processor
-
-        if not hasattr(evaluate_single_trajectory, "_processor"):
-            evaluate_single_trajectory._processor = build_processor(
-                "nvidia/Eagle-Block2A-2B-v2", {"trust_remote_code": True}
-            )
-        formatted_text = evaluate_single_trajectory._processor.apply_chat_template(
-            conversation, tokenize=False, add_generation_prompt=False
+        # Prepare batch for inference using processor methods
+        # This uses processor's _apply_vlm_processing for VLM content (lines 747-782)
+        # and pad_state_to_checkpoint_dim for state padding (matches lines 871-877)
+        policy_batch = prepare_inference_batch(
+            frame=frame,
+            camera_keys=camera_keys,
+            state_key=state_key,
+            language_key=language_key,
+            processor=policy._processor,
+            embodiment_tag=embodiment_tag,
+            checkpoint_max_state_dim=policy._checkpoint_max_state_dim,
+            device=policy.device,
         )
-
-        # Create vlm_content in the format expected by the model's collator
-        policy_batch["vlm_content"] = {
-            "text": formatted_text,
-            "images": pil_images,
-            "conversation": conversation,
-        }
-
-        # Extract and prepare state
-        for _state_key_name, state_array in groot_batch.get("state", {}).items():
-            # Ensure proper shape: (T, D) -> (1, D) for single timestep inference
-            if state_array.ndim == 2:
-                state_tensor = torch.from_numpy(state_array[0:1]).to(policy.device).float()
-            else:
-                state_tensor = torch.from_numpy(state_array).unsqueeze(0).to(policy.device).float()
-            policy_batch["state"] = state_tensor
-
-            # Provide raw_state for relative->absolute action conversion
-            # The processor's decode_action expects state organized by modality keys
-            # (e.g., {'arm_left_qpos': ..., 'trunk_qpos': ...}) to convert relative->absolute.
-            # Since LeRobot datasets have flattened state, we pass a dict with a generic key.
-            # This allows unnormalization to work but relative->absolute conversion may use
-            # the fallback mechanism in the processor (which maps to the generic "state" key).
-            #
-            # NOTE: For proper relative->absolute conversion with behavior_r1_pro, the state
-            # dict would need keys like: arm_left_qpos, arm_right_qpos, trunk_qpos
-            # Since we can't split the flat LeRobot state, the relative actions will be
-            # unnormalized but may remain in relative space (which is still valid for
-            # comparison if ground truth is also in the same relative space).
-            policy_batch["raw_state"] = {"state": state_array}
-
-            if step_count == 0:
-                # Log warning about state structure on first step
-                state_modality_keys = (
-                    modality_configs.get("state", {}).modality_keys
-                    if "state" in modality_configs
-                    else ["state"]
+        
+        # Log warning about state structure on first step
+        if step_count == 0:
+            state_modality_keys = (
+                modality_configs.get("state", {}).modality_keys
+                if "state" in modality_configs
+                else ["state"]
+            )
+            if len(state_modality_keys) > 1:
+                logger.warning(
+                    f"Model expects {len(state_modality_keys)} state keys: {state_modality_keys[:5]}... "
+                    f"LeRobot provides flat state. Relative->absolute conversion may be skipped."
                 )
-                if len(state_modality_keys) > 1:
-                    logger.warning(
-                        f"Model expects {len(state_modality_keys)} state keys: {state_modality_keys[:5]}... "
-                        f"LeRobot provides flat state. Relative->absolute conversion may be skipped."
-                    )
-            break  # Use first state key
-
-        # Set embodiment_id using the embodiment_tag_to_id mapping
-        from lerobot.policies.gr00t_n1d6.utils import EMBODIMENT_TAG_TO_PROJECTOR_INDEX
-
-        embodiment_id = EMBODIMENT_TAG_TO_PROJECTOR_INDEX.get(
-            embodiment_tag.value, 10
-        )  # Default to new_embodiment=10
-        policy_batch["embodiment_id"] = torch.tensor([embodiment_id], device=policy.device, dtype=torch.long)
 
         # Run inference
         try:
