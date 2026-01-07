@@ -668,6 +668,7 @@ class Gr00tN1d6Policy(PreTrainedPolicy):
         # Get device from model parameters
         device = next(self.parameters()).device
 
+
         # Use bf16 autocast for inference to keep memory low and match backbone dtype
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=self.config.use_bf16):
             outputs = self._groot_model.get_action(groot_inputs)

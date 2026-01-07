@@ -335,11 +335,11 @@ def make_pre_post_processors(
                 return (preprocessor, postprocessor)
             except FileNotFoundError:
                 # If pretrained processor doesn't exist, create new one
-                from lerobot.policies.gr00t_n1d6.processor_gr00t_n1d6 import (
-                    make_gr00t_n1d6_pre_post_processors,
+                from lerobot.policies.gr00t_n1d6.real_processor_gr00t_n1d6 import (
+                    make_real_gr00t_n1d6_pre_post_processors,
                 )
 
-                preprocessor, postprocessor = make_gr00t_n1d6_pre_post_processors(
+                preprocessor, postprocessor = make_real_gr00t_n1d6_pre_post_processors(
                     config=policy_cfg,
                     dataset_stats=kwargs.get("dataset_stats"),
                 )

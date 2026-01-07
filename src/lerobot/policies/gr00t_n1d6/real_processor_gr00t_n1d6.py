@@ -573,7 +573,7 @@ class VLAStepData:
 # =============================================================================
 
 
-class Gr00tN1d6Processor:
+class RealGr00tN1d6Processor:
     """
     Main processor for Groot N1.6.
 
@@ -610,138 +610,8 @@ class Gr00tN1d6Processor:
         embodiment_id_mapping: dict[str, int] | None = None,
         transformers_loading_kwargs: dict | None = None,
     ):
-        if transformers_loading_kwargs is None:
-            transformers_loading_kwargs = {"trust_remote_code": True}
+        pass
 
-        self.modality_configs = parse_modality_configs(modality_configs)
-
-        # Initialize StateActionProcessor for state/action normalization
-        self.state_action_processor = StateActionProcessor(
-            modality_configs=modality_configs,
-            statistics=statistics,
-            use_percentiles=use_percentiles,
-            clip_outliers=clip_outliers,
-            apply_sincos_state_encoding=apply_sincos_state_encoding,
-            use_relative_action=use_relative_action,
-        )
-
-        # Save state action processor settings
-        self.use_percentiles = use_percentiles
-        self.clip_outliers = clip_outliers
-        self.apply_sincos_state_encoding = apply_sincos_state_encoding
-        self.use_relative_action = use_relative_action
-
-        # Save VLM settings
-        self.formalize_language = formalize_language
-        self.model_name = model_name
-        self.model_type = model_type
-
-        self.max_state_dim = max_state_dim
-        self.max_action_dim = max_action_dim
-        self.max_action_horizon = max_action_horizon
-
-        # Save image processing settings
-        self.image_crop_size = image_crop_size
-        self.image_target_size = image_target_size
-        self.random_rotation_angle = random_rotation_angle
-        self.color_jitter_params = color_jitter_params
-        self.processor = build_processor(model_name, transformers_loading_kwargs)
-        # Set padding side to 'left' for Flash Attention compatibility
-        self.processor.tokenizer.padding_side = "left"
-        self.embodiment_id_mapping = embodiment_id_mapping or EMBODIMENT_TAG_TO_PROJECTOR_INDEX.copy()
-        # Handle case where fine-tuning embodiment tag is not in pre-trained mapping
-        for k, v in EMBODIMENT_TAG_TO_PROJECTOR_INDEX.items():
-            if k not in self.embodiment_id_mapping:
-                self.embodiment_id_mapping[k] = v
-        self.shortest_image_edge = shortest_image_edge
-        self.crop_fraction = crop_fraction
-
-        # Choose between torchvision and albumentations transforms
-        # Check if albumentations is available, fall back to torchvision if not
-        if use_albumentations and not ALBUMENTATIONS_AVAILABLE:
-            warnings.warn(
-                "use_albumentations_transforms=True but albumentations is not installed. "
-                "Falling back to torchvision transforms. Install albumentations with: "
-                "pip install albumentations==1.4.18",
-                UserWarning,
-                stacklevel=2,
-            )
-            use_albumentations = False
-
-        self.use_albumentations = use_albumentations
-        if use_albumentations:
-            self.train_image_transform, self.eval_image_transform = (
-                build_image_transformations_albumentations(
-                    image_target_size,
-                    image_crop_size,
-                    random_rotation_angle,
-                    color_jitter_params,
-                    shortest_image_edge,
-                    crop_fraction,
-                )
-            )
-        else:
-            self.train_image_transform, self.eval_image_transform = build_image_transformations(
-                image_target_size,
-                image_crop_size,
-                random_rotation_angle,
-                color_jitter_params,
-                shortest_image_edge,
-                crop_fraction,
-            )
-        self._collator = self.data_collator_class(
-            model_name=model_name,
-            model_type=model_type,
-            transformers_loading_kwargs=transformers_loading_kwargs,
-        )
-        self.training = True
-
-    @property
-    def collator(self):
-        return self._collator
-
-    def train(self):
-        self.training = True
-        self.state_action_processor.train()
-
-    def eval(self):
-        self.training = False
-        self.state_action_processor.eval()
-
-    def set_statistics(
-        self,
-        statistics: dict[str, dict[str, dict[str, dict[str, list[float]]]]],
-        override: bool = False,
-    ) -> None:
-        """Set dataset statistics for normalization."""
-        self.state_action_processor.set_statistics(statistics, override=override)
-
-        # Compute action dimensions for convenience
-        self.action_dim = {}
-        for embodiment_tag in self.state_action_processor.statistics:
-            self.action_dim[embodiment_tag] = self.state_action_processor.get_action_dim(embodiment_tag)
-
-    def decode_action(
-        self,
-        action: np.ndarray,
-        embodiment_tag: EmbodimentTag,
-        state: dict[str, np.ndarray] | None = None,
-    ):
-        """Undo action normalization and convert relative actions to absolute."""
-        # Split concatenated action into joint groups
-        out_dict = {}
-        start_idx = 0
-        joint_groups = self.modality_configs[embodiment_tag.value]["action"].modality_keys
-        action_horizon = len(self.modality_configs[embodiment_tag.value]["action"].delta_indices)
-        for key in joint_groups:
-            joint_dim = self.state_action_processor.norm_params[embodiment_tag.value]["action"][key][
-                "dim"
-            ].item()
-            out_dict[key] = action[..., :action_horizon, start_idx : start_idx + joint_dim]
-            start_idx += joint_dim
-
-        # Use StateActionProcessor to unnormalize and convert to absolute
-        return self.state_action_processor.unapply_action(out_dict, embodiment_tag.value, state=state)
 
     def _apply_vlm_processing(self, images: np.ndarray, language: str) -> dict:
         """
@@ -784,129 +654,7 @@ class Gr00tN1d6Processor:
         self,
         messages: list[dict[str, Any]],
     ):
-        """
-        Process a list of messages containing VLAStepData.
-
-        Args:
-            messages: List with single message dict containing 'content' as VLAStepData
-
-        Returns:
-            Dict with processed inputs for model
-        """
-        assert len(messages) == 1
-        content = messages[0]["content"]
-        embodiment_tag = content.embodiment
-        action_data = content.actions
-        state_data = content.states
-
-        # Use StateActionProcessor to handle relative conversion and normalization
-        normalized_states, normalized_actions = self.state_action_processor.apply(
-            state=state_data,
-            action=action_data,
-            embodiment_tag=embodiment_tag.value,
-        )
-
-        if normalized_actions:
-            # Concatenate actions
-            action_keys = self.modality_configs[embodiment_tag.value]["action"].modality_keys
-            # Ensure all action arrays are 2D (t, d) before concatenation
-            action_tensors = []
-            for key in action_keys:
-                arr = normalized_actions[key]
-                arr_tensor = torch.from_numpy(arr)
-                # Reshape to (t, d) if needed
-                if arr_tensor.ndim == 1:
-                    # (d,) -> (1, d)
-                    arr_tensor = arr_tensor.unsqueeze(0)
-                elif arr_tensor.ndim == 3:
-                    # (1, t, d) or (t, 1, d) -> (t, d)
-                    if arr_tensor.shape[0] == 1:
-                        arr_tensor = arr_tensor.squeeze(0)
-                    elif arr_tensor.shape[1] == 1:
-                        arr_tensor = arr_tensor.squeeze(1)
-                    else:
-                        # (b, t, d) -> take first batch, (t, d)
-                        arr_tensor = arr_tensor[0]
-                action_tensors.append(arr_tensor)
-            normalized_actions = torch.cat(action_tensors, dim=-1)  # (t, d)
-            action_dim = normalized_actions.shape[1]
-            # Pad action to max_action_dim
-            normalized_actions = torch.cat(
-                [
-                    normalized_actions,
-                    torch.zeros(
-                        normalized_actions.shape[0],
-                        self.max_action_dim - normalized_actions.shape[1],
-                    ),
-                ],
-                dim=-1,
-            )  # (t, max_action_dim)
-            # Pad action to max_action_horizon
-            action_horizon = normalized_actions.shape[0]
-            normalized_actions = torch.cat(
-                [
-                    normalized_actions,
-                    torch.zeros(
-                        self.max_action_horizon - normalized_actions.shape[0],
-                        self.max_action_dim,
-                    ),
-                ],
-                dim=0,
-            )  # (max_action_horizon, max_action_dim)
-            # Create action mask
-            action_mask = torch.ones_like(normalized_actions)
-            action_mask[action_horizon:] = 0
-            action_mask[:, action_dim:] = 0
-        else:
-            assert not self.training, "Action is required in training mode"
-            normalized_actions = None
-            action_mask = None
-
-        # Concatenate states
-        state_keys = self.modality_configs[embodiment_tag.value]["state"].modality_keys
-        normalized_states = torch.cat(
-            [torch.from_numpy(normalized_states[key]) for key in state_keys], dim=-1
-        )
-        normalized_states = torch.cat(
-            [
-                normalized_states,
-                torch.zeros(normalized_states.shape[0], self.max_state_dim - normalized_states.shape[1]),
-            ],
-            dim=-1,
-        )
-
-        # Crop and resize images
-        image_transform = self.train_image_transform if self.training else self.eval_image_transform
-        # Use actual image keys from content.images if available, otherwise fall back to modality_configs
-        if content.images:
-            image_keys = list(content.images.keys())
-        else:
-            image_keys = self.modality_configs[embodiment_tag.value]["video"].modality_keys
-
-        if self.formalize_language:
-            language = content.text.lower()
-            language = re.sub(r"[^\w\s]", "", language)
-        else:
-            language = content.text
-
-        vlm_inputs = self._get_vlm_inputs(
-            image_keys=image_keys,
-            images=content.images,
-            image_transform=image_transform,
-            language=language,
-        )
-
-        transformed_inputs = {
-            "state": normalized_states.to(torch.get_default_dtype()),
-        }
-        if normalized_actions is not None:
-            transformed_inputs["action"] = normalized_actions.to(torch.get_default_dtype())
-        # Add VLM inputs
-        transformed_inputs.update(vlm_inputs)
-        if action_mask is not None:
-            transformed_inputs["action_mask"] = action_mask
-        transformed_inputs["embodiment_id"] = self.embodiment_id_mapping[embodiment_tag.value]
-        return transformed_inputs
+        pass
 
     def _get_vlm_inputs(
         self,
@@ -978,14 +726,20 @@ from lerobot.utils.constants import (  # noqa: E402
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
 
+def build_processor(model_name: str, transformers_loading_kwargs: dict) -> ProcessorMixin:
+    """Build the Eagle processor for VLM inputs."""
+    assert model_name == "nvidia/Eagle-Block2A-2B-v2", f"Processor for {model_name} not supported"
+    eagle_path = os.path.join(os.path.dirname(__file__), "eagle3_model")
+    return AutoProcessor.from_pretrained(eagle_path, **transformers_loading_kwargs)
 
-@ProcessorStepRegistry.register(name="gr00t_n1d6_process_v1")
-class Gr00tN1d6ProcessStep(ProcessorStep):
+
+@ProcessorStepRegistry.register(name="gr00t_n1d6_process_v1_real")
+class RealGr00tN1d6ProcessStep(ProcessorStep):
     """Processor step that uses Gr00tN1d6Processor to transform LeRobot format to model format."""
 
     def __init__(
         self,
-        processor: Gr00tN1d6Processor | None = None,
+        processor: RealGr00tN1d6Processor | None = None,
         language_key: str = "task",
         processor_config_path: str | None = None,
     ):
@@ -994,8 +748,12 @@ class Gr00tN1d6ProcessStep(ProcessorStep):
         self.processor_config_path = processor_config_path
         self._pending_state: dict[str, torch.Tensor] | None = None
 
+        self.vlm_processor = build_processor(
+                "nvidia/Eagle-Block2A-2B-v2", {"trust_remote_code": True}
+            )
+
     @property
-    def processor(self) -> Gr00tN1d6Processor:
+    def processor(self) -> RealGr00tN1d6Processor:
         """Lazy initialization of processor from config if not provided."""
         if self._processor is None:
             if self.processor_config_path is None:
@@ -1037,7 +795,7 @@ class Gr00tN1d6ProcessStep(ProcessorStep):
                 }
             }
 
-            self._processor = Gr00tN1d6Processor(
+            self._processor = RealGr00tN1d6Processor(
                 modality_configs=modality_configs,
                 statistics=None,  # Will be set via load_state_dict
                 formalize_language=policy_config.formalize_language,
@@ -1072,132 +830,61 @@ class Gr00tN1d6ProcessStep(ProcessorStep):
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         """Convert LeRobot transition to format expected by Gr00tN1d6 model."""
+
         obs = transition.get(TransitionKey.OBSERVATION, {}) or {}
         comp = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}) or {}
 
-        # Extract images
-        img_keys = sorted([k for k in obs if k.startswith("observation.images.")])
-        if not img_keys and "observation.image" in obs:
-            img_keys = ["observation.image"]
+        groot_inputs = {}
+        groot_inputs['state'] = obs.get('observation.state', {})
+        groot_inputs['embodiment_id'] = torch.tensor([10]).to(torch.device("cuda"))  # Assuming single embodiment for now
 
-        # Extract state
-        state = obs.get("observation.state", None)
-        if state is None:
-            raise ValueError("observation.state is required")
-
-        # Extract action (may be None for inference)
-        action = transition.get(TransitionKey.ACTION, None)
-
-        # Set processor to eval mode if no action (inference mode)
-        # This is important because StateActionProcessor.apply() asserts not training when action is None
-        if action is None:
-            self.processor.eval()
-
-        # Extract language
-        language = comp.get(self.language_key, "")
-        # Handle case where language is a list (after batch processing)
-        if isinstance(language, list):
-            language = language[0] if language else ""
-        if not language:
-            language = ""
+        # Extract and convert images to PIL format for vlm_content
+        pil_images = []
+        for _cam_key, img_tensor in obs.items():
+            if 'images' not in _cam_key:
+                continue
+            # convert (B C H W) to PIL Image (W H C)
+            img = img_tensor[0] if img_tensor.ndim == 4 else img_tensor
+            img = np.transpose(img.data.cpu().numpy(), (1, 2, 0))  #
+            if img.dtype != np.uint8:
+                img = (img * 255).astype(np.uint8) if img.max() <= 1.0 else img.astype(np.uint8)
+            pil_images.append(Image.fromarray(img))
 
 
-        # Get embodiment tag from processor's mapping (use first key as default)
-        # embodiment_tag_mapping = self.processor.embodiment_id_mapping
-        # embodiment_tag_str = (
-        #     list(embodiment_tag_mapping.keys())[0] if embodiment_tag_mapping else "new_embodiment"
-        # )
-        embodiment_tag_str = "behavior_r1_pro"
+            # # img_tensor shape: (T, H, W, C) - take first frame for inference
+            # img = img_tensor[0] if img_tensor.ndim == 4 else img_tensor
+            # # Convert to PIL Image
+            # if img.dtype != np.uint8:
+            #     img = (img * 255).astype(np.uint8) if img.max() <= 1.0 else img.astype(np.uint8)
+            # pil_images.append(Image.fromarray(img))
 
-        # Convert images to numpy arrays (VLAStepData expects dict[str, list[np.ndarray]])
-        images_dict = {}
-        for img_key in img_keys:
-            # Remove "observation.images." prefix to get view name
-            view_name = img_key.replace("observation.images.", "").replace("observation.image", "image")
-            img_tensor = obs[img_key]
+        # Create conversation format for the VLM
+        conversation = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": comp['task'][0]},
+                    *[{"type": "image", "image": img} for img in pil_images],
+                ],
+            }
+        ]
 
-            # Convert to numpy array
-            if isinstance(img_tensor, torch.Tensor):
-                # Handle batch dimension: (B, C, H, W) or (C, H, W)
-                if img_tensor.ndim == 4:
-                    # Batch dimension present - take first element
-                    img_np = img_tensor[0].permute(1, 2, 0).cpu().numpy()
-                else:
-                    # No batch dimension
-                    img_np = img_tensor.permute(1, 2, 0).cpu().numpy()
-
-                # Convert from [0, 1] float to [0, 255] uint8 if needed
-                if img_np.dtype != np.uint8:
-                    img_np = (img_np * 255).astype(np.uint8)
-
-                images_dict[view_name] = [img_np]  # List of numpy arrays
-            elif isinstance(img_tensor, np.ndarray):
-                images_dict[view_name] = [img_tensor]
-            else:
-                # Assume PIL Image
-                images_dict[view_name] = [np.array(img_tensor)]
-
-        # Convert state to dict format expected by StateActionProcessor
-        # Need to match modality_keys from modality_configs
-        state_dict = {}
-        if isinstance(state, torch.Tensor):
-            state_np = state.cpu().numpy()
-            # Get state modality keys from processor config
-            if embodiment_tag_str in self.processor.modality_configs:
-                state_keys = (
-                    self.processor.modality_configs[embodiment_tag_str].get("state", {}).modality_keys
-                )
-                if state_keys:
-                    # Split state tensor according to modality keys
-                    # For now, use a single key "state" if we can't determine the split
-                    state_dict[state_keys[0]] = state_np
-                else:
-                    state_dict["state"] = state_np
-            else:
-                state_dict["state"] = state_np
-        else:
-            state_dict = state
-
-        # Convert action to dict format
-        action_dict = None
-        if action is not None:
-            if isinstance(action, torch.Tensor):
-                action_np = action.cpu().numpy()
-                # Get action modality keys from processor config
-                if embodiment_tag_str in self.processor.modality_configs:
-                    action_keys = (
-                        self.processor.modality_configs[embodiment_tag_str].get("action", {}).modality_keys
-                    )
-                    # Split action tensor according to modality keys
-                    # For now, use a single key "action" if we can't determine the split
-                    action_dict = {action_keys[0]: action_np} if action_keys else {"action": action_np}
-                else:
-                    action_dict = {"action": action_np}
-            else:
-                action_dict = action
-
-        # Create VLAStepData
-        # Note: VLAStepData is defined in this file, EmbodimentTag is imported at top
-        try:
-            embodiment_tag_enum = EmbodimentTag(embodiment_tag_str)
-        except ValueError:
-            # If not a valid enum value, use NEW_EMBODIMENT
-            embodiment_tag_enum = EmbodimentTag.NEW_EMBODIMENT
-
-        vla_step_data = VLAStepData(
-            images=images_dict,
-            text=language,
-            states=state_dict,
-            actions=action_dict,
-            embodiment=embodiment_tag_enum,
+        formatted_text = self.vlm_processor.apply_chat_template(
+            conversation, tokenize=False, add_generation_prompt=False
         )
 
+        groot_inputs["vlm_content"] = {
+            "text": formatted_text,
+            "images": pil_images,
+            "conversation": conversation,
+        }
+
+
         # Call processor with message format
-        messages = [{"content": vla_step_data}]
-        processed = self.processor(messages)
+        # messages = [{"content": groot_inputs}]
 
         # Update transition with processed inputs
-        transition[TransitionKey.OBSERVATION] = processed
+        transition[TransitionKey.OBSERVATION] = groot_inputs
         return transition
 
     def transform_features(
@@ -1283,200 +970,31 @@ class Gr00tN1d6ProcessStep(ProcessorStep):
             self.processor.state_action_processor.set_statistics(reconstructed, override=True)
 
 
-@ProcessorStepRegistry.register(name="gr00t_n1d6_unnormalizer_v1")
-class Gr00tN1d6UnnormalizerStep(ProcessorStep):
-    """Processor step that unnormalizes actions and handles relative->absolute conversion.
+@ProcessorStepRegistry.register(name="gr00t_n1d6_post_v1_real")
+class RealGR00tN1d6PostStep(ProcessorStep):
+    """Postprocessor step that converts model outputs back to LeRobot action format."""
 
-    This step is used in the postprocessor pipeline to:
-    1. Unnormalize actions using statistics from the Gr00tN1d6Processor
-    2. Optionally convert relative actions to absolute actions
-
-    This follows the LeRobot pattern where unnormalization happens in the postprocessor,
-    not inside the policy's predict_action_chunk method.
-    """
-
-    def __init__(
-        self,
-        processor: Gr00tN1d6Processor | None = None,
-        embodiment_tag: str = "new_embodiment",
-        action_dim: int | None = None,
-    ):
-        """Initialize the unnormalizer step.
-
-        Args:
-            processor: The Gr00tN1d6Processor instance with normalization statistics
-            embodiment_tag: The embodiment tag for action decoding
-            action_dim: Optional action dimension to truncate to (for matching env action space)
-        """
-        self._processor = processor
-        self.embodiment_tag = embodiment_tag
-        self.action_dim = action_dim
-        self._pending_state: dict[str, torch.Tensor] | None = None
-
-    @property
-    def processor(self) -> Gr00tN1d6Processor | None:
-        return self._processor
-
-    def set_processor(self, processor: Gr00tN1d6Processor) -> None:
-        """Set the processor for action decoding."""
-        self._processor = processor
-        # Apply any pending state
-        if self._pending_state is not None:
-            self.load_state_dict(self._pending_state)
-            self._pending_state = None
+    def __init__(self):
+        self.action_offset = 7
+        self.action_dim = 6
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
-        """Unnormalize actions in the transition.
-
-        Args:
-            transition: The transition containing normalized actions
-
-        Returns:
-            The transition with unnormalized actions
-        """
         new_transition = transition.copy()
         action = new_transition.get(TransitionKey.ACTION)
-
-        if action is None:
-            return new_transition
-
-        if not isinstance(action, PolicyAction):
-            raise ValueError(f"Action should be a PolicyAction type got {type(action)}")
-
-        # If no processor is set, just pass through (useful for testing)
-        if self._processor is None:
-            return new_transition
-
-        # Convert to numpy for processor
-        actions_np = action.float().cpu().numpy()
-
-        # Handle different input shapes:
-        # - select_action returns [B, action_dim] (single timestep)
-        # - predict_action_chunk returns [B, horizon, action_dim]
-        # decode_action expects [B, horizon, action_dim], so add horizon dim if needed
-        squeeze_horizon = False
-        if actions_np.ndim == 2:
-            # [B, action_dim] -> [B, 1, action_dim]
-            actions_np = actions_np[:, np.newaxis, :]
-            squeeze_horizon = True
-
-        # Get raw state for relative->absolute conversion if available
-        # This would come from the observation stored during preprocessing
-        raw_state = new_transition.get(TransitionKey.COMPLEMENTARY_DATA, {}).get("raw_state")
-
-        # Decode actions: unnormalize and convert relative->absolute
-        embodiment_tag_enum = EmbodimentTag(self.embodiment_tag)
-        decoded_actions = self._processor.decode_action(
-            actions_np,
-            embodiment_tag_enum,
-            state=raw_state,
-        )
-
-        # Concatenate all action groups back into a single tensor
-        modality_keys = self._processor.modality_configs[self.embodiment_tag]["action"].modality_keys
-        action_tensors = []
-        for key in modality_keys:
-            action_arr = decoded_actions[key]
-            action_tensor = torch.from_numpy(action_arr)
-            if action_tensor.ndim == 2:
-                action_tensor = action_tensor.unsqueeze(1)  # [B, D] -> [B, 1, D]
-            action_tensors.append(action_tensor)
-
-        # Concatenate along action dimension
-        decoded_actions_tensor = torch.cat(action_tensors, dim=-1)
-
-        # Determine action dimension to truncate to:
-        # 1. Use explicitly set action_dim if provided
-        # 2. Otherwise, infer from statistics (the 'min' or 'mean' tensor shape tells us the dim)
-        action_dim_to_use = self.action_dim
-        if action_dim_to_use is None:
-            # Get action dim from processor's statistics (tensor shapes encode dimension)
-            try:
-                stats = self._processor.state_action_processor.statistics.get(
-                    self.embodiment_tag, {}
-                ).get("action", {})
-                if stats:
-                    # Sum dimensions across all joint groups
-                    action_dim_to_use = 0
-                    for joint_group, joint_stats in stats.items():
-                        # Get dim from any stat tensor (e.g., 'min', 'mean')
-                        if "min" in joint_stats:
-                            action_dim_to_use += len(joint_stats["min"])
-                        elif "mean" in joint_stats:
-                            action_dim_to_use += len(joint_stats["mean"])
-            except (AttributeError, KeyError, TypeError):
-                pass
-
-        # Truncate to action_dim if we have a valid dimension
-        if action_dim_to_use is not None and action_dim_to_use > 0:
-            if decoded_actions_tensor.shape[-1] > action_dim_to_use:
-                decoded_actions_tensor = decoded_actions_tensor[..., :action_dim_to_use]
-
-        # Remove the horizon dimension if we added it for single-timestep input
-        if squeeze_horizon and decoded_actions_tensor.ndim == 3:
-            # [B, 1, action_dim] -> [B, action_dim]
-            decoded_actions_tensor = decoded_actions_tensor.squeeze(1)
-
-        new_transition[TransitionKey.ACTION] = decoded_actions_tensor
-
+        action_processed = action[:, self.action_offset : self.action_offset + self.action_dim]
+        new_transition[TransitionKey.ACTION] = action_processed
+        
         return new_transition
+        
 
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
     ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
-        """Returns input features unchanged."""
+        
         return features
 
-    def get_config(self) -> dict[str, Any]:
-        """Returns serializable configuration."""
-        return {
-            "embodiment_tag": self.embodiment_tag,
-            "action_dim": self.action_dim,
-        }
-
-    def state_dict(self) -> dict[str, torch.Tensor]:
-        """Returns normalization statistics as a flat state dictionary.
-
-        NOTE: This step shares statistics with Gr00tN1d6ProcessStep.
-        The statistics are saved by Gr00tN1d6ProcessStep in the preprocessor.
-        This step only needs to load them for the postprocessor.
-        """
-        # The processor's statistics are saved by Gr00tN1d6ProcessStep
-        # This step doesn't need to save separately
-        return {}
-
-    def load_state_dict(self, state: dict[str, torch.Tensor]) -> None:
-        """Loads normalization statistics from a flat state dictionary."""
-        if not state:
-            return
-
-        # If processor doesn't exist yet, store state for later
-        if self._processor is None:
-            self._pending_state = state
-            return
-
-        # Reconstruct nested statistics dict from flat keys
-        reconstructed: dict[str, dict[str, dict[str, dict[str, list[float]]]]] = {}
-
-        for flat_key, tensor in state.items():
-            parts = flat_key.split(".")
-            if len(parts) == 4:
-                emb_tag, modality, joint_group, stat_name = parts
-
-                if emb_tag not in reconstructed:
-                    reconstructed[emb_tag] = {}
-                if modality not in reconstructed[emb_tag]:
-                    reconstructed[emb_tag][modality] = {}
-                if joint_group not in reconstructed[emb_tag][modality]:
-                    reconstructed[emb_tag][modality][joint_group] = {}
-
-                reconstructed[emb_tag][modality][joint_group][stat_name] = tensor.tolist()
-
-        if reconstructed:
-            self._processor.state_action_processor.set_statistics(reconstructed, override=True)
-
-
-def make_gr00t_n1d6_pre_post_processors(
+# TODO: Refactor to share code with Gr00tN1d6ProcessStep initialization
+def make_real_gr00t_n1d6_pre_post_processors(
     config: Gr00tN1d6Config,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
 ) -> tuple[
@@ -1561,7 +1079,7 @@ def make_gr00t_n1d6_pre_post_processors(
     }
 
     # Create processor instance
-    processor = Gr00tN1d6Processor(
+    processor = RealGr00tN1d6Processor(
         modality_configs=modality_configs,
         statistics=statistics,
         formalize_language=config.formalize_language,
@@ -1586,7 +1104,7 @@ def make_gr00t_n1d6_pre_post_processors(
     input_steps: list[ProcessorStep] = [
         RenameObservationsProcessorStep(rename_map={}),
         AddBatchDimensionProcessorStep(),
-        Gr00tN1d6ProcessStep(processor=processor, language_key="task"),
+        RealGr00tN1d6ProcessStep(processor=processor, language_key="task"),
         DeviceProcessorStep(device=config.device),
     ]
 
@@ -1607,11 +1125,7 @@ def make_gr00t_n1d6_pre_post_processors(
             action_dim = action_feature.shape[0]
 
     output_steps: list[ProcessorStep] = [
-        Gr00tN1d6UnnormalizerStep(
-            processor=processor,
-            embodiment_tag=config.embodiment_tag,
-            action_dim=action_dim,
-        ),
+        RealGR00tN1d6PostStep(),
         DeviceProcessorStep(device="cpu"),
     ]
 

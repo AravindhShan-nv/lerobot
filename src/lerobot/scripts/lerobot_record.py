@@ -305,7 +305,7 @@ def record_loop(
 
         # Get robot observation
         obs = robot.get_observation()
-
+        
         # Applies a pipeline to the raw robot observation, default is IdentityProcessor
         obs_processed = robot_observation_processor(obs)
 

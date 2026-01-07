@@ -524,6 +524,8 @@ def evaluate_single_trajectory(
         # Get current frame
         frame = episode_frames[step_count]
 
+        import ipdb; ipdb.set_trace()
+
         # Convert to GR00T format using convert_lerobot_to_groot_batch
         groot_batch = convert_lerobot_to_groot_batch(frame, camera_keys, state_key, language_key)
 
@@ -626,6 +628,8 @@ def evaluate_single_trajectory(
         )  # Default to new_embodiment=10
         policy_batch["embodiment_id"] = torch.tensor([embodiment_id], device=policy.device, dtype=torch.long)
 
+        import ipdb; ipdb.set_trace()
+
         # Run inference
         try:
             with torch.no_grad():
@@ -683,6 +687,8 @@ def evaluate_single_trajectory(
                 # 1. Unnormalizes actions using pretrained model's statistics
                 # 2. Converts relative->absolute if state is provided
                 # Therefore, we should NOT unnormalize again here!
+
+                import ipdb; ipdb.set_trace()
 
         except Exception as e:
             logger.error(f"Error during inference at step {step_count}: {e}", exc_info=True)
