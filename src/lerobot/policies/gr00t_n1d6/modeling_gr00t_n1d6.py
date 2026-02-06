@@ -695,7 +695,9 @@ class Gr00tN1d6Policy(PreTrainedPolicy):
 
         if len(self._action_queue) == 0:
             actions = self.predict_action_chunk(batch)
-            # Transpose to (n_action_steps, B, action_dim) for queue
+            # Slice to n_action_steps before extend — deque(maxlen=N) silently
+            # drops from the LEFT on overflow, keeping far-future actions instead.
+            actions = actions[:, :self.config.n_action_steps, :]
             self._action_queue.extend(actions.transpose(0, 1))
 
         return self._action_queue.popleft()
