@@ -38,6 +38,8 @@ import numpy as np
 import torch
 import torchvision.transforms.v2 as transforms
 
+from lerobot.processor import RobotObservation
+
 # Try to import albumentations, but make it optional
 try:
     import albumentations as A  # noqa: N812
@@ -154,6 +156,30 @@ class ModalityConfig:
             self.action_configs = parsed_action_configs
         else:
             self.action_configs = None
+
+
+# Inference-only helper: used by online policy inference to preserve GR00T input format.
+def prepare_observation_for_inference_gr00t_n1d6(
+    observation: dict[str, np.ndarray],
+    task: str | None = None,
+    robot_type: str | None = None,
+) -> RobotObservation:
+    """Prepare GR00T N1.6 inference observations without image cast/permute.
+
+    This keeps camera tensors in uint8 HWC format on CPU and only adds a batch
+    dimension so the GR00T processor can consume them directly in S2.
+    """
+    for name in observation:
+        tensor = torch.from_numpy(observation[name])
+
+        if "image" in name and tensor.dtype != torch.uint8:
+            tensor = tensor.to(torch.uint8)
+        observation[name] = tensor.unsqueeze(0)
+
+    observation["task"] = task if task else ""
+    observation["robot_type"] = robot_type if robot_type else ""
+
+    return observation
 
 
 # =============================================================================

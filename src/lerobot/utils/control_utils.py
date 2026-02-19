@@ -102,22 +102,19 @@ def predict_action(
         torch.inference_mode(),
         torch.autocast(device_type=device.type) if device.type == "cuda" and use_amp else nullcontext(),
     ):
-        # Convert to pytorch format: channel first and float32 in [0,1] with batch dimension
-        observation = prepare_observation_for_inference(observation, device, task, robot_type)
+        # Convert to pytorch format: channel first and float32 in [0,1] with batch dimension.
+        # For GR00T N1.6, use policy-specific observation prep that keeps images as
+        # uint8 HWC on CPU (no cast/permute), matching the GR00T processor input path.
+        if getattr(policy, "name", None) == "gr00t_n1d6":
+            from lerobot.policies.gr00t_n1d6.utils import (
+                prepare_observation_for_inference_gr00t_n1d6,
+            )
 
-        if _debug:
-            print(f"\n[STEP 2] After prepare_observation_for_inference:")
-            for k, v in observation.items():
-                if isinstance(v, torch.Tensor):
-                    if "image" in k:
-                        print(f"  {k}: shape={v.shape}, dtype={v.dtype}, range=[{v.min():.3f}, {v.max():.3f}]")
-                    elif "state" in k:
-                        print(f"  {k}: shape={v.shape}, values={v.flatten()[:6].cpu().numpy()}")
-                    else:
-                        print(f"  {k}: shape={v.shape}")
-                else:
-                    print(f"  {k}: {type(v).__name__} = {v}")
-
+            observation = prepare_observation_for_inference_gr00t_n1d6(
+                observation, task=task, robot_type=robot_type
+            )
+        else:
+            observation = prepare_observation_for_inference(observation, device, task, robot_type)
         observation = preprocessor(observation)
 
         # Compute the next action with the policy

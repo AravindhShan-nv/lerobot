@@ -143,7 +143,7 @@ class StateActionProcessor:
             if key not in self.statistics or override:
                 self.statistics[key] = deepcopy(statistics[key])
             else:
-                print(f"Embodiment tag {key} already in statistics, skipping updating")
+                warnings.warn(f"Embodiment tag {key} already in statistics, skipping updating")
         self._compute_normalization_parameters()
 
     def _compute_normalization_parameters(self) -> None:
@@ -1124,13 +1124,11 @@ class Gr00tN1d6ProcessStep(ProcessorStep):
         batch_size = len(languages) if isinstance(languages, list) else 1
         assert np.all(state.shape[0] == batch_size for state in [state]), f"State batch size mismatch: expected {batch_size}, got {[state.shape[0] for state in [state]]}"
         assert np.all(action[key].shape[0] == batch_size for key in action) if action is not None else True, f"Action batch size mismatch: expected {batch_size}, got {[action[key].shape[0] for key in action]}"
-
         processed_list = []
         state_np = state.cpu().numpy()
         action_np = action.cpu().numpy() if action is not None else None
         raw_state_for_postprocessor = None  # Store first state_dict for postprocessor
 
-        
         for i in range(batch_size):
             # Convert images to numpy arrays (VLAStepData expects dict[str, list[np.ndarray]])
             images_dict = {}
@@ -1139,21 +1137,38 @@ class Gr00tN1d6ProcessStep(ProcessorStep):
                 view_name = img_key.replace("observation.images.", "").replace("observation.image", "image")
                 img_tensor = obs[img_key]
 
-                # Convert to numpy array
+                # Convert to numpy array.
+                # IMPORTANT: keep direct HWC uint8 extraction for GR00T inference path
+                # and avoid float->uint8 + CHW<->HWC convert-back logic.
                 if isinstance(img_tensor, torch.Tensor):
-                    # Handle batch dimension: (B, C, H, W) or (C, H, W)
                     if img_tensor.ndim == 4:
-                        # Batch dimension present - take first element
-                        img_np = img_tensor[i].permute(1, 2, 0).cpu().numpy()
+                        img_slice = img_tensor[i]
                     else:
-                        # No batch dimension
-                        img_np = img_tensor.permute(1, 2, 0).cpu().numpy()
+                        img_slice = img_tensor
 
-                    # Convert from [0, 1] float to [0, 255] uint8 if needed
-                    if img_np.dtype != np.uint8:
-                        img_np = (img_np * 255).astype(np.uint8)
-
-                    images_dict[view_name] = [img_np]  # List of numpy arrays
+                    # Support both layouts:
+                    # - Inference fast path: HWC uint8 (no extra conversion).
+                    # - Training/data path: CHW (convert to HWC; quantize if float).
+                    if img_slice.ndim == 3 and img_slice.shape[-1] == 3:
+                        # HWC
+                        if img_slice.dtype == torch.uint8:
+                            img_np = img_slice.cpu().numpy()
+                        elif torch.is_floating_point(img_slice):
+                            img_np = (img_slice.clamp(0, 1) * 255).to(torch.uint8).cpu().numpy()
+                        else:
+                            img_np = img_slice.to(torch.uint8).cpu().numpy()
+                    elif img_slice.ndim == 3 and img_slice.shape[0] == 3:
+                        # CHW -> HWC
+                        if torch.is_floating_point(img_slice):
+                            img_slice = (img_slice.clamp(0, 1) * 255).to(torch.uint8)
+                        elif img_slice.dtype != torch.uint8:
+                            img_slice = img_slice.to(torch.uint8)
+                        img_np = img_slice.permute(1, 2, 0).contiguous().cpu().numpy()
+                    else:
+                        raise ValueError(
+                            f"Unsupported image tensor shape for {img_key}: {tuple(img_slice.shape)}"
+                        )
+                    images_dict[view_name] = [img_np]
                 elif isinstance(img_tensor, np.ndarray):
                     images_dict[view_name] = [img_tensor]
                 else:
@@ -1173,7 +1188,6 @@ class Gr00tN1d6ProcessStep(ProcessorStep):
                         # Split state tensor according to modality keys and modality metadata
                         from lerobot.policies.gr00t_n1d6.utils import EMBODIMENT_STAT_CONFIGS
 
-                        # Check if we have modality metadata for slicing
                         if embodiment_tag_str in EMBODIMENT_STAT_CONFIGS:
                             modality_meta = EMBODIMENT_STAT_CONFIGS[embodiment_tag_str]["modality_meta"]
                             for s_key in state_keys:
@@ -1203,7 +1217,6 @@ class Gr00tN1d6ProcessStep(ProcessorStep):
                         # Split action tensor according to modality keys and modality metadata
                         from lerobot.policies.gr00t_n1d6.utils import EMBODIMENT_STAT_CONFIGS
 
-                        # Check if we have modality metadata for slicing
                         if embodiment_tag_str in EMBODIMENT_STAT_CONFIGS:
                             modality_meta = EMBODIMENT_STAT_CONFIGS[embodiment_tag_str]["modality_meta"]
                             for a_key in action_keys:
@@ -1242,7 +1255,6 @@ class Gr00tN1d6ProcessStep(ProcessorStep):
             # Calling the Gr00tN1d6 Processor
             processed = self.processor([{"content": vla_step_data}])
             processed_list.append(processed)
-
         collated = self.processor.collator(processed_list).data["inputs"]
 
         # Bring tensors to correct device
@@ -1268,8 +1280,8 @@ class Gr00tN1d6ProcessStep(ProcessorStep):
 
         # Update transition with processed inputs
         transition[TransitionKey.OBSERVATION] = collated
-        return transition 
-        
+        return transition
+
 
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
