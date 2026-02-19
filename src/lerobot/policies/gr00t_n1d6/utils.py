@@ -796,12 +796,12 @@ LIBERO_PANDA_MODALITY_META = {
     },
 }
 
-# Video keys match HuggingFaceVLA/libero column names:
-#   observation.images.image → "image", observation.images.image2 → "image2"
+# Video keys match IPEC-COMMUNITY/libero_10_no_noops_1.0.0_lerobot datasetcolumn names:
+#   observation.images.image → "image", observation.images.wrist_image → "wrist_image"
 LIBERO_PANDA_MODALITY_CONFIG = {
     "video": ModalityConfig(
         delta_indices=[0],
-        modality_keys=["image", "image2"],
+        modality_keys=["image", "wrist_image"],
     ),
     "state": ModalityConfig(
         delta_indices=[0],
