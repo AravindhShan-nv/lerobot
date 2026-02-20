@@ -1081,162 +1081,261 @@ class Gr00tN1d6ProcessStep(ProcessorStep):
 
         return self._processor
     
+    def _get_image_keys(self, obs: dict[str, Any]) -> list[str]:
+        img_keys = sorted([k for k in obs if k.startswith("observation.images.")])
+        if not img_keys and "observation.image" in obs:
+            img_keys = ["observation.image"]
+        return img_keys
+
+    def _get_embodiment_tag(self) -> tuple[str, EmbodimentTag]:
+        embodiment_tag_mapping = self.processor.embodiment_id_mapping
+        embodiment_tag_str = next(iter(embodiment_tag_mapping), "new_embodiment")
+        try:
+            return embodiment_tag_str, EmbodimentTag(embodiment_tag_str)
+        except ValueError:
+            return embodiment_tag_str, EmbodimentTag.NEW_EMBODIMENT
+
+    def _get_modality_meta(self, embodiment_tag_str: str) -> dict[str, Any] | None:
+        from lerobot.policies.gr00t_n1d6.utils import EMBODIMENT_STAT_CONFIGS
+
+        if embodiment_tag_str in EMBODIMENT_STAT_CONFIGS:
+            return EMBODIMENT_STAT_CONFIGS[embodiment_tag_str]["modality_meta"]
+        return None
+
+    def _get_modality_keys(
+        self, embodiment_tag_str: str
+    ) -> tuple[list[str] | None, list[str] | None]:
+        if embodiment_tag_str not in self.processor.modality_configs:
+            return None, None
+
+        state_cfg = self.processor.modality_configs[embodiment_tag_str].get("state", {})
+        action_cfg = self.processor.modality_configs[embodiment_tag_str].get("action", {})
+        state_keys = state_cfg.modality_keys if hasattr(state_cfg, "modality_keys") else None
+        action_keys = action_cfg.modality_keys if hasattr(action_cfg, "modality_keys") else None
+        return state_keys, action_keys
+
+    def _build_image_cache(
+        self,
+        obs: dict[str, Any],
+        img_keys: list[str],
+        batch_size: int,
+    ) -> dict[str, np.ndarray]:
+        # Convert/transfer image streams once per key and reuse inside the batch loop.
+        # Canonical cached format is numpy uint8 with shape [B, H, W, C].
+        image_cache: dict[str, np.ndarray] = {}
+        for img_key in img_keys:
+            img_value = obs[img_key]
+            # Torch path is common in both training and inference.
+            # We normalize tensors once here so the inner per-sample loop only indexes.
+            if isinstance(img_value, torch.Tensor):
+                img_tensor = img_value
+                # Accept unbatched image tensors by promoting to batch size 1.
+                if img_tensor.ndim == 3:
+                    img_tensor = img_tensor.unsqueeze(0)
+                # After optional promotion, only batched image tensors are supported.
+                if img_tensor.ndim != 4:
+                    raise ValueError(
+                        f"Unsupported image tensor rank for {img_key}: {img_tensor.ndim}. Expected 3 or 4 dims."
+                    )
+
+                # Handle HWC and CHW inputs from inference/training paths.
+                # HWC branch: [B, H, W, C]. Keep/convert dtype to uint8.
+                if img_tensor.shape[-1] == 3:
+                    if torch.is_floating_point(img_tensor):
+                        # Float images are assumed in [0,1]; quantize once.
+                        img_tensor = (img_tensor.clamp(0, 1) * 255).to(torch.uint8)
+                    elif img_tensor.dtype != torch.uint8:
+                        # Non-float, non-uint8 integer-like tensors are cast to uint8.
+                        img_tensor = img_tensor.to(torch.uint8)
+                # CHW branch: [B, C, H, W]. Convert to HWC and normalize dtype once.
+                elif img_tensor.shape[1] == 3:
+                    if torch.is_floating_point(img_tensor):
+                        img_tensor = (img_tensor.clamp(0, 1) * 255).to(torch.uint8)
+                    elif img_tensor.dtype != torch.uint8:
+                        img_tensor = img_tensor.to(torch.uint8)
+                    # Keep memory contiguous to avoid downstream view/copy penalties.
+                    img_tensor = img_tensor.permute(0, 2, 3, 1).contiguous()
+                # Any other channel layout is unexpected for this processor.
+                else:
+                    raise ValueError(
+                        f"Unsupported image tensor shape for {img_key}: {tuple(img_tensor.shape)}"
+                    )
+
+                # Single device-to-host transfer per key.
+                img_data = img_tensor.detach().to("cpu").numpy()
+            # Numpy path supports pre-materialized arrays from non-torch callers/tests.
+            elif isinstance(img_value, np.ndarray):
+                img_data = img_value
+                # Accept unbatched HWC/CHW arrays by promoting to batch size 1.
+                if img_data.ndim == 3:
+                    img_data = img_data[np.newaxis, ...]
+                # After optional promotion, only batched arrays are supported.
+                if img_data.ndim != 4:
+                    raise ValueError(
+                        f"Unsupported image array rank for {img_key}: {img_data.ndim}. Expected 3 or 4 dims."
+                    )
+
+                # Handle HWC and CHW numpy inputs.
+                # HWC branch: [B, H, W, C].
+                if img_data.shape[-1] == 3:
+                    pass
+                # CHW branch: [B, C, H, W] -> [B, H, W, C].
+                elif img_data.shape[1] == 3:
+                    img_data = np.transpose(img_data, (0, 2, 3, 1))
+                # Any other channel layout is unexpected for this processor.
+                else:
+                    raise ValueError(
+                        f"Unsupported image array shape for {img_key}: {tuple(img_data.shape)}"
+                    )
+
+                # Normalize dtype once to uint8 to match GR00T image expectations.
+                if np.issubdtype(img_data.dtype, np.floating):
+                    # Float arrays are assumed in [0,1]; clip then quantize once.
+                    img_data = np.clip(img_data, 0.0, 1.0)
+                    img_data = (img_data * 255.0).astype(np.uint8)
+                elif img_data.dtype != np.uint8:
+                    # Non-float, non-uint8 arrays are cast to uint8.
+                    img_data = img_data.astype(np.uint8)
+            # Defensive type guard for unexpected caller inputs.
+            else:
+                raise TypeError(f"Unsupported image type for {img_key}: {type(img_value)}")
+
+            # Ensure cached image tensor/array is aligned with this transition batch.
+            if img_data.shape[0] != batch_size:
+                raise ValueError(
+                    f"Image batch size mismatch for {img_key}: expected {batch_size}, got {img_data.shape[0]}"
+                )
+
+            # Cache normalized image stream once; inner loop only performs img_data[i].
+            image_cache[img_key] = img_data
+        return image_cache
+
+    def _build_images_dict_for_item(
+        self,
+        image_cache: dict[str, np.ndarray],
+        view_name_by_key: dict[str, str],
+        idx: int,
+    ) -> dict[str, list[np.ndarray]]:
+        images_dict: dict[str, list[np.ndarray]] = {}
+        for img_key, view_name in view_name_by_key.items():
+            images_dict[view_name] = [image_cache[img_key][idx]]
+        return images_dict
+
+    def _build_state_dict_for_item(
+        self,
+        state: Any,
+        state_np: np.ndarray,
+        state_keys: list[str] | None,
+        modality_meta: dict[str, Any] | None,
+        is_state_tensor: bool,
+        idx: int,
+    ) -> dict[str, Any]:
+        state_dict = {}
+        if is_state_tensor:
+            if state_keys:
+                if modality_meta is not None:
+                    for s_key in state_keys:
+                        start_idx = modality_meta["state"][s_key]["start"]
+                        end_idx = modality_meta["state"][s_key]["end"]
+                        state_dict[s_key] = state_np[idx][np.newaxis, start_idx:end_idx]
+                else:
+                    for s_key in state_keys:
+                        state_dict[s_key] = state_np[idx][np.newaxis, :]
+            else:
+                state_dict["state"] = state_np
+        else:
+            state_dict = state
+        return state_dict
+
+    def _build_action_dict_for_item(
+        self,
+        action: Any,
+        action_np: np.ndarray | None,
+        action_keys: list[str] | None,
+        modality_meta: dict[str, Any] | None,
+        is_action_tensor: bool,
+        idx: int,
+    ) -> dict[str, Any]:
+        action_dict = {}
+        if action is not None:
+            if is_action_tensor:
+                if action_keys:
+                    if modality_meta is not None:
+                        for a_key in action_keys:
+                            start_idx = modality_meta["action"][a_key]["start"]
+                            end_idx = modality_meta["action"][a_key]["end"]
+                            if action_np[idx].ndim == 1:
+                                action_dict[a_key] = action_np[idx][np.newaxis, start_idx:end_idx]
+                            else:
+                                action_dict[a_key] = action_np[idx][:, start_idx:end_idx]
+                    else:
+                        for a_key in action_keys:
+                            action_dict[a_key] = action_np[idx]
+                else:
+                    action_dict = {"action": action_np}
+            else:
+                action_dict = action
+        return action_dict
+
+    def _ensure_complementary_data(self, transition: EnvTransition) -> dict[str, Any]:
+        if TransitionKey.COMPLEMENTARY_DATA not in transition:
+            transition[TransitionKey.COMPLEMENTARY_DATA] = {}
+        return transition[TransitionKey.COMPLEMENTARY_DATA]
+
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         """Convert LeRobot transition to format expected by Gr00tN1d6 model."""
         obs = transition.get(TransitionKey.OBSERVATION, {}) or {}
         comp = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}) or {}
+        img_keys = self._get_image_keys(obs)
 
-        # Extract images
-        img_keys = sorted([k for k in obs if k.startswith("observation.images.")])
-        if not img_keys and "observation.image" in obs:
-            img_keys = ["observation.image"]
-
-        # Extract state
         state = obs.get("observation.state", None)
         if state is None:
             raise ValueError("observation.state is required")
 
-        # Extract action (may be None for inference)
         action = transition.get(TransitionKey.ACTION, None)
-
-        # Set processor to eval mode if no action (inference mode)
-        # This is important because StateActionProcessor.apply() asserts not training when action is None
         if action is None:
             self.processor.eval()
 
-        # Extract language
         languages = comp.get(self.language_key, "")
-
-        # Get embodiment tag from processor's mapping (use first key as default)
-        embodiment_tag_mapping = self.processor.embodiment_id_mapping
-        embodiment_tag_str = (
-            list(embodiment_tag_mapping.keys())[0] if embodiment_tag_mapping else "new_embodiment"
-        )
-
-        # Create VLAStepData
-        # Note: VLAStepData is defined in this file, EmbodimentTag is imported at top
-        try:
-            embodiment_tag_enum = EmbodimentTag(embodiment_tag_str)
-        except ValueError:
-            # If not a valid enum value, use NEW_EMBODIMENT
-            embodiment_tag_enum = EmbodimentTag.NEW_EMBODIMENT
+        embodiment_tag_str, embodiment_tag_enum = self._get_embodiment_tag()
 
         batch_size = len(languages) if isinstance(languages, list) else 1
         assert np.all(state.shape[0] == batch_size for state in [state]), f"State batch size mismatch: expected {batch_size}, got {[state.shape[0] for state in [state]]}"
         assert np.all(action[key].shape[0] == batch_size for key in action) if action is not None else True, f"Action batch size mismatch: expected {batch_size}, got {[action[key].shape[0] for key in action]}"
+
         processed_list = []
-        state_np = state.cpu().numpy()
-        action_np = action.cpu().numpy() if action is not None else None
-        raw_state_for_postprocessor = None  # Store first state_dict for postprocessor
+        state_np = state.detach().to("cpu").numpy()
+        action_np = action.detach().to("cpu").numpy() if action is not None else None
+        raw_state_for_postprocessor = None
+        is_state_tensor = isinstance(state, torch.Tensor)
+        is_action_tensor = isinstance(action, torch.Tensor) if action is not None else False
+        modality_meta = self._get_modality_meta(embodiment_tag_str)
+        state_keys, action_keys = self._get_modality_keys(embodiment_tag_str)
+        image_cache = self._build_image_cache(obs, img_keys, batch_size)
+        view_name_by_key = {
+            img_key: img_key.replace("observation.images.", "").replace("observation.image", "image")
+            for img_key in img_keys
+        }
 
+        # Per-sample preprocessing loop: build model-ready VLAStepData for each batch item.
         for i in range(batch_size):
-            # Convert images to numpy arrays (VLAStepData expects dict[str, list[np.ndarray]])
-            images_dict = {}
-            for img_key in img_keys:
-                # Remove "observation.images." prefix to get view name
-                view_name = img_key.replace("observation.images.", "").replace("observation.image", "image")
-                img_tensor = obs[img_key]
-
-                # Convert to numpy array.
-                # IMPORTANT: keep direct HWC uint8 extraction for GR00T inference path
-                # and avoid float->uint8 + CHW<->HWC convert-back logic.
-                if isinstance(img_tensor, torch.Tensor):
-                    if img_tensor.ndim == 4:
-                        img_slice = img_tensor[i]
-                    else:
-                        img_slice = img_tensor
-
-                    # Support both layouts:
-                    # - Inference fast path: HWC uint8 (no extra conversion).
-                    # - Training/data path: CHW (convert to HWC; quantize if float).
-                    if img_slice.ndim == 3 and img_slice.shape[-1] == 3:
-                        # HWC
-                        if img_slice.dtype == torch.uint8:
-                            img_np = img_slice.cpu().numpy()
-                        elif torch.is_floating_point(img_slice):
-                            img_np = (img_slice.clamp(0, 1) * 255).to(torch.uint8).cpu().numpy()
-                        else:
-                            img_np = img_slice.to(torch.uint8).cpu().numpy()
-                    elif img_slice.ndim == 3 and img_slice.shape[0] == 3:
-                        # CHW -> HWC
-                        if torch.is_floating_point(img_slice):
-                            img_slice = (img_slice.clamp(0, 1) * 255).to(torch.uint8)
-                        elif img_slice.dtype != torch.uint8:
-                            img_slice = img_slice.to(torch.uint8)
-                        img_np = img_slice.permute(1, 2, 0).contiguous().cpu().numpy()
-                    else:
-                        raise ValueError(
-                            f"Unsupported image tensor shape for {img_key}: {tuple(img_slice.shape)}"
-                        )
-                    images_dict[view_name] = [img_np]
-                elif isinstance(img_tensor, np.ndarray):
-                    images_dict[view_name] = [img_tensor]
-                else:
-                    # Assume PIL Image
-                    images_dict[view_name] = [np.array(img_tensor)]
-
-            # Convert state to dict format expected by StateActionProcessor
-            # Need to match modality_keys from modality_configs
-            state_dict = {}
-            if isinstance(state, torch.Tensor):
-                # Get state modality keys from processor config
-                if embodiment_tag_str in self.processor.modality_configs:
-                    state_keys = (
-                        self.processor.modality_configs[embodiment_tag_str].get("state", {}).modality_keys
-                    )
-                    if state_keys:
-                        # Split state tensor according to modality keys and modality metadata
-                        from lerobot.policies.gr00t_n1d6.utils import EMBODIMENT_STAT_CONFIGS
-
-                        if embodiment_tag_str in EMBODIMENT_STAT_CONFIGS:
-                            modality_meta = EMBODIMENT_STAT_CONFIGS[embodiment_tag_str]["modality_meta"]
-                            for s_key in state_keys:
-                                start_idx = modality_meta["state"][s_key]["start"]
-                                end_idx = modality_meta["state"][s_key]["end"]
-                                state_dict[s_key] = state_np[i][np.newaxis, start_idx:end_idx]
-                        else:
-                            # Fallback: assign full state to each key (old behavior)
-                            for s_key in state_keys:
-                                state_dict[s_key] = state_np[i][np.newaxis, :]
-                    else:
-                        state_dict["state"] = state_np
-                else:
-                    state_dict["state"] = state_np
-            else:
-                state_dict = state
-
-            # Convert action to dict format
-            action_dict = {}
-            if action is not None:
-                if isinstance(action, torch.Tensor):
-                    # Get action modality keys from processor config
-                    if embodiment_tag_str in self.processor.modality_configs:
-                        action_keys = (
-                            self.processor.modality_configs[embodiment_tag_str].get("action", {}).modality_keys
-                        )
-                        # Split action tensor according to modality keys and modality metadata
-                        from lerobot.policies.gr00t_n1d6.utils import EMBODIMENT_STAT_CONFIGS
-
-                        if embodiment_tag_str in EMBODIMENT_STAT_CONFIGS:
-                            modality_meta = EMBODIMENT_STAT_CONFIGS[embodiment_tag_str]["modality_meta"]
-                            for a_key in action_keys:
-                                start_idx = modality_meta["action"][a_key]["start"]
-                                end_idx = modality_meta["action"][a_key]["end"]
-                                # Handle both 1D (inference) and 2D (training with action horizon) arrays
-                                if action_np[i].ndim == 1:
-                                    # Inference case: (action_dim,) -> add newaxis to get (1, action_dim_slice)
-                                    action_dict[a_key] = action_np[i][np.newaxis, start_idx:end_idx]
-                                else:
-                                    # Training case: (action_horizon, action_dim) -> slice to (action_horizon, action_dim_slice)
-                                    action_dict[a_key] = action_np[i][:, start_idx:end_idx]
-                        else:
-                            # Fallback: assign full action to each key (old behavior)
-                            for a_key in action_keys:
-                                action_dict[a_key] = action_np[i]
-                    else:
-                        action_dict = {"action": action_np}
-                else:
-                    action_dict = action
+            images_dict = self._build_images_dict_for_item(image_cache, view_name_by_key, i)
+            state_dict = self._build_state_dict_for_item(
+                state=state,
+                state_np=state_np,
+                state_keys=state_keys,
+                modality_meta=modality_meta,
+                is_state_tensor=is_state_tensor,
+                idx=i,
+            )
+            action_dict = self._build_action_dict_for_item(
+                action=action,
+                action_np=action_np,
+                action_keys=action_keys,
+                modality_meta=modality_meta,
+                is_action_tensor=is_action_tensor,
+                idx=i,
+            )
 
             language = languages[i] if isinstance(languages, list) else languages
             vla_step_data = VLAStepData(
@@ -1247,38 +1346,23 @@ class Gr00tN1d6ProcessStep(ProcessorStep):
                 embodiment=embodiment_tag_enum,
             )
 
-            # Save raw state_dict from first iteration for postprocessor
-            # (all items in batch have same observation, so we only need one copy)
             if i == 0 and raw_state_for_postprocessor is None:
                 raw_state_for_postprocessor = state_dict.copy()
 
-            # Calling the Gr00tN1d6 Processor
             processed = self.processor([{"content": vla_step_data}])
             processed_list.append(processed)
-        collated = self.processor.collator(processed_list).data["inputs"]
 
-        # Bring tensors to correct device
+        collated = self.processor.collator(processed_list).data["inputs"]
         if "pixel_values" in collated:
             for j in range(len(collated["pixel_values"])):
                 collated["pixel_values"][j] = collated["pixel_values"][j].to(state.device)
 
-        # Store raw (unnormalized) state for postprocessor
-        # The postprocessor needs this for relative->absolute action conversion
+        comp_out = self._ensure_complementary_data(transition)
         if raw_state_for_postprocessor is not None:
-            if TransitionKey.COMPLEMENTARY_DATA not in transition:
-                transition[TransitionKey.COMPLEMENTARY_DATA] = {}
-            transition[TransitionKey.COMPLEMENTARY_DATA]["raw_state"] = raw_state_for_postprocessor
-            # Also cache on the shared processor instance so the postprocessor can access it
-            # even when raw_state is not passed through the transition (e.g., predict_action flow)
+            comp_out["raw_state"] = raw_state_for_postprocessor
             self.processor._cached_raw_state = raw_state_for_postprocessor
 
-        # Pass processor reference through the batch so select_action() can decode
-        # the full action chunk with per-timestep stats
-        if TransitionKey.COMPLEMENTARY_DATA not in transition:
-            transition[TransitionKey.COMPLEMENTARY_DATA] = {}
-        transition[TransitionKey.COMPLEMENTARY_DATA]["_gr00t_processor"] = self.processor
-
-        # Update transition with processed inputs
+        comp_out["_gr00t_processor"] = self.processor
         transition[TransitionKey.OBSERVATION] = collated
         return transition
 
